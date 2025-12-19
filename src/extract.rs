@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 use anyhow::{Result, Context};
 use pdf_extract;
 
@@ -7,21 +8,20 @@ use crate::models::FileDoc;
 use crate::config::{PREVIEW_MAX_LENGTH, SENTENCE_SEARCH_START};
 
 pub fn extract_text(path: &Path) -> Result<FileDoc> {
+    // 简单的防抖动：如果是刚创建的文件，可能还在写入中，稍微等一下
+    // 实际生产中通常用 Debouncer，这里简化处理
+    std::thread::sleep(Duration::from_millis(100));
+
     let extension = path.extension()
         .and_then(|ext| ext.to_str())
         .unwrap_or("");
 
-    println!("正在处理: {:?}", path);
+    println!("📄 正在解析: {:?}", path);
 
     let content = match extension {
-        "txt" | "md" => fs::read_to_string(path)?, // 普通文本直接读
-        "pdf" => {
-            //  提取 PDF 文本
-            pdf_extract::extract_text(path)
-                .with_context(|| "无法解析 PDF")?
-        },
-        // "docx" => { ... 稍后实现 ... },
-        _ => return Err(anyhow::anyhow!("不支持的文件格式")),
+        "txt" | "md" | "rs" => fs::read_to_string(path)?,
+        "pdf" => pdf_extract::extract_text(path).with_context(|| "无法解析 PDF")?,
+        _ => return Err(anyhow::anyhow!("跳过不支持的文件格式")),
     };
 
     Ok(FileDoc {

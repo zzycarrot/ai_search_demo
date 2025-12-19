@@ -20,3 +20,5 @@ tantivy-jieba = "0.17"  # 中文分词支持
 # AI 模型 [cite: 7, 13]
 # 我们用 fastembed，因为它轻量、无需 Python 环境，且模型自动下载
 fastembed = "4"
+
+notify = "6.0"
