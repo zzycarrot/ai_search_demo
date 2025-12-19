@@ -1,0 +1,22 @@
+[package]
+name = "ai_search_demo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# 基础工具
+anyhow = "1.0" # 错误处理神器，新手必备
+walkdir = "2.3" # 递归遍历文件夹
+
+# 文本提取 
+pdf-extract = "0.10" # 对应 Python 的 pdfminer
+# docx-rs = "0.4"     # 对应 Python 的 python-docx
+
+# 搜索与索引核心 
+
+tantivy = "0.25" # Rust 界最强的搜索引擎库（类似 Lucene/Elasticsearch）
+tantivy-jieba = "0.17"  # 中文分词支持
+
+# AI 模型 [cite: 7, 13]
+# 我们用 fastembed，因为它轻量、无需 Python 环境，且模型自动下载
+fastembed = "4"
