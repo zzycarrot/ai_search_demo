@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -33,6 +33,7 @@ pub fn init_persistent_index(index_path: &Path) -> Result<(Index, Schema)> {
     schema_builder.add_text_field("body", text_options.clone());
     schema_builder.add_text_field("path", STRING | STORED);
     schema_builder.add_text_field("tags", text_options.clone());
+    schema_builder.add_u64_field("timestamp", FAST | STORED);
 
     let schema = schema_builder.build();
 
@@ -48,10 +49,69 @@ pub fn init_persistent_index(index_path: &Path) -> Result<(Index, Schema)> {
     Ok((index, schema))
 }
 
+// 检查文件是否需要索引
+// 返回 true 表示：数据库里没这个文件，或者文件变新了，需要重新搞
+fn should_index_file(path: &Path, index: &Index, schema: &Schema) -> bool {
+    let path_str = path.to_string_lossy();
+    let reader = match index.reader() {
+        Ok(r) => r,
+        Err(_) => return true, // 读不出索引就默认重建
+    };
+    let searcher = reader.searcher();
+    
+    let path_field = schema.get_field("path").unwrap();
+    let timestamp_field = schema.get_field("timestamp").unwrap();
+
+    // 1. 在索引里查这个路径
+    let query = Term::from_field_text(path_field, &path_str);
+    let term_query = tantivy::query::TermQuery::new(query, IndexRecordOption::Basic);
+    
+    // 找匹配的文档
+    let top_docs = match searcher.search(&term_query, &tantivy::collector::TopDocs::with_limit(1)) {
+        Ok(docs) => docs,
+        Err(_) => return true,
+    };
+
+    if top_docs.is_empty() {
+        return true; // 数据库里没这个文件 -> 必须索引
+    }
+
+    // 2. 如果找到了，读取它存的时间戳
+    let (_score, doc_address) = top_docs[0];
+    let doc: TantivyDocument = match searcher.doc(doc_address) {
+        Ok(d) => d,
+        Err(_) => return true,
+    };
+    
+    // 获取数据库里的旧时间
+    let stored_ts = doc.get_first(timestamp_field)
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    // 3. 获取硬盘文件当前的时间戳
+    let current_ts = fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::now())
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // 4. 比对：如果硬盘文件时间 > 数据库存的时间，说明文件被修改过 -> 需要索引
+    current_ts > stored_ts
+}
+
 // 处理单个文件 (改为 pub 供 watcher 使用)
 pub fn process_and_index(file_path: &Path, index: &Index, schema: &Schema, bert: &BertModel) -> Result<()> {
     // 调用 extract 模块的功能
     let doc_data = extract_text(file_path)?;
+
+    // 【修改点 2】获取文件当前时间戳
+    let file_timestamp = fs::metadata(file_path)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::now())
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
     // --- AI 核心步骤：生成关键词 ---
     println!("   [AI] 正在分析文档语义...");
@@ -64,6 +124,7 @@ pub fn process_and_index(file_path: &Path, index: &Index, schema: &Schema, bert:
     let body_field = schema.get_field("body").unwrap();
     let path_field = schema.get_field("path").unwrap();
     let tags_field = schema.get_field("tags").unwrap();
+    let timestamp_field = schema.get_field("timestamp").unwrap();
     // 每次创建 writer 开销较大，但在 Watcher 这种低频场景下是可以接受的
     let mut index_writer: IndexWriter = index.writer(50_000_000)?;
 
@@ -76,7 +137,8 @@ pub fn process_and_index(file_path: &Path, index: &Index, schema: &Schema, bert:
         title_field => doc_data.title.as_str(),
         body_field => doc_data.content.as_str(),
         path_field => doc_data.path.as_str(),
-        tags_field => tags_str // <--- 存入 AI 生成的标签
+        tags_field => tags_str, // <--- 存入 AI 生成的标签
+        timestamp_field => file_timestamp // 【修改点 3】写入时间戳
     ))?;
 
     index_writer.commit()?;
@@ -105,10 +167,19 @@ pub fn scan_existing_files(watch_path: &Path, index: &Index, schema: &Schema, be
                         let ext = extension.to_string_lossy().to_lowercase();
                         if matches!(ext.as_str(), "txt" | "md" | "pdf") {
                              if !path.to_string_lossy().contains(".DS_Store") {
-                                match process_and_index(&path, index, schema, bert) {
-                                    Ok(_) => *file_count += 1,
-                                    Err(e) => eprintln!("处理文件失败 {:?}: {}", path, e),
+                                
+                                // 【修改点 4】 增加判断逻辑
+                                if should_index_file(&path, index, schema) {
+                                    // 只有需要更新时，才执行繁重的 AI 和索引任务
+                                    match process_and_index(&path, index, schema, bert) {
+                                        Ok(_) => *file_count += 1,
+                                        Err(e) => eprintln!("处理文件失败 {:?}: {}", path, e),
+                                    }
+                                } else {
+                                    // 否则跳过
+                                    // println!(" [跳过] 文件未修改: {:?}", path.file_name().unwrap());
                                 }
+                                
                              }
                         }
                     }
