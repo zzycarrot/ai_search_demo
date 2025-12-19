@@ -6,10 +6,11 @@ use anyhow::Result;
 // 引入你的库 (确保 Cargo.toml 中 name = "ai_search_demo")
 use ai_search_demo::indexer;
 use ai_search_demo::search;
+use ai_search_demo::config;
 
 fn main() -> Result<()> {
-    let watch_path = Path::new("./docs");
-    let storage_path = Path::new("./storage");
+    let watch_path = Path::new(config::WATCH_PATH);
+    let storage_path = Path::new(config::STORAGE_PATH);
 
     if !watch_path.exists() { std::fs::create_dir_all(watch_path)?; }
 
