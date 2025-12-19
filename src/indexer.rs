@@ -70,7 +70,7 @@ pub fn process_and_index(file_path: &Path, index: &Index, schema: &Schema) -> Re
 
     index_writer.commit()?;
 
-    println!("\n✅ [后台] 新文件已索引: {} (输入搜索词继续)", doc_data.title);
+    println!("\n[Done] [后台] 新文件已索引: {} (输入搜索词继续)", doc_data.title);
     print!("> ");
     io::stdout().flush()?;
 

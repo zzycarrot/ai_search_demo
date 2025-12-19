@@ -22,7 +22,7 @@ pub fn search_index(index: &Index, query_str: &str) -> Result<()> {
     let query = match query_parser.parse_query(query_str) {
         Ok(q) => q,
         Err(_) => {
-            println!("   ❌ 查询语法错误，请重试 (例如: 'Rust AND Linux')");
+            println!("   查询语法错误，请重试 (例如: 'Rust AND Linux')");
             return Ok(());
         }
     };
@@ -30,7 +30,7 @@ pub fn search_index(index: &Index, query_str: &str) -> Result<()> {
     let top_docs = searcher.search(&query, &TopDocs::with_limit(5))?;
 
     if top_docs.is_empty() {
-        println!("   📭 没有找到相关文档");
+        println!("     没有找到相关文档");
     }
 
     for (_score, doc_address) in top_docs {
@@ -41,7 +41,7 @@ pub fn search_index(index: &Index, query_str: &str) -> Result<()> {
         
         // 可选：在这里调用 extract::format_content_preview 来显示摘要
         // 但为了性能，这里只显示标题和路径
-        println!("   📄 [{}] (Score: {:.2}) \n       路径: {}", title, _score, path);
+        println!("   [{}] (Score: {:.2}) \n       路径: {}", title, _score, path);
     }
 
     Ok(())

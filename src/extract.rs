@@ -16,7 +16,7 @@ pub fn extract_text(path: &Path) -> Result<FileDoc> {
         .and_then(|ext| ext.to_str())
         .unwrap_or("");
 
-    println!("📄 正在解析: {:?}", path);
+    println!("正在解析文件: {:?}", path);
 
     let content = match extension {
         "txt" | "md" | "rs" => fs::read_to_string(path)?,
