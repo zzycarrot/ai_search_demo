@@ -22,6 +22,35 @@ impl BertModel {
             jieba: Jieba::new(),
         })
     }
+    pub fn refine_query(&self, origin_query: &str) -> String {
+        // 1. 如果输入太短（比如就两个字），直接返回，不用 AI 猜
+        if origin_query.chars().count() < 4 {
+            return origin_query.to_string();
+        }
+
+        // 2. 尝试提取 2 个核心关键词
+        match self.extract_keywords(origin_query, 2) {
+            Ok(keywords) => {
+                if keywords.is_empty() {
+                    // 没提取出来，降级回原文
+                    origin_query.to_string()
+                } else {
+                    let refined = keywords.join(" ");
+                    
+                    // 只有当关键词和原句不一样时，才提示用户
+                    if refined != origin_query {
+                        println!("   [AI] 意图识别: '{}' -> '{}'", origin_query, refined);
+                        return refined;
+                    }
+                    origin_query.to_string()
+                }
+            },
+            Err(e) => {
+                eprintln!(" [AI] 意图分析失败: {}", e);
+                origin_query.to_string()
+            }
+        }
+    }
 
     pub fn extract_keywords(&self, text: &str, top_k: usize) -> Result<Vec<String>> {
         let truncated_text = if text.chars().count() > 512 {

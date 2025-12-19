@@ -53,10 +53,12 @@ fn main() -> Result<()> {
         if input.is_empty() {
             continue;
         }
+        //bert 来优化查询
+        let search_query = bert.refine_query(input);
 
         // 调用 lib 里的 search 模块进行搜索
         // 注意：Tantivy 的 Reader 会自动感知 index 的变化，所以这里不需要手动 reload
-        if let Err(e) = search::search_index(&index, input) {
+        if let Err(e) = search::search_index(&index, &search_query) {
             println!("搜索出错: {}", e);
         }
     }

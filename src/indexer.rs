@@ -54,10 +54,10 @@ pub fn process_and_index(file_path: &Path, index: &Index, schema: &Schema, bert:
     let doc_data = extract_text(file_path)?;
 
     // --- AI 核心步骤：生成关键词 ---
-    println!(" 🤖 [AI] 正在分析文档语义...");
+    println!("   [AI] 正在分析文档语义...");
     let keywords = bert.extract_keywords(&doc_data.content, 3)?; // 提取 3 个关键词
     let tags_str = keywords.join(" "); // 变成 "Rust 编程 教程" 这样的字符串存入
-    println!(" 🏷️ [AI] 生成标签: {:?}", keywords);
+    println!("   [AI] 生成标签: {:?}", keywords);
     // ---------------------------
 
     let title_field = schema.get_field("title").unwrap();
