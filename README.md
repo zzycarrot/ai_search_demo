@@ -42,7 +42,8 @@
 
 ```bash
 cargo build --release
-
+//or
+cargo zigbuild --release --target riscv64gc-unknown-linux-gnu
 ```
 
 ### 2. 准备目录
@@ -59,6 +60,10 @@ mkdir -p docs storage
 ```bash
 cargo run
 
+```
+如果网络不好可以本地下载BAAI/bge-small-zh-v1.5拷贝到rvbook的model目录
+```bash
+hf download BAAI/bge-small-zh-v1.5 --local-dir . 
 ```
 
 服务启动后将显示 AI 模型加载及增量扫描状态：

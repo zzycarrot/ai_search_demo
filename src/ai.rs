@@ -1,11 +1,11 @@
 use anyhow::Result;
-// 【修改 1】引入 IndexOp trait，解决 output.i() 报错
 use candle_core::{Device, Tensor, IndexOp};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel as CandleBert, Config};
 use hf_hub::api::sync::Api;
 use jieba_rs::Jieba;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
 pub struct BertModel {
@@ -17,26 +17,41 @@ pub struct BertModel {
 
 impl BertModel {
     pub fn new() -> Result<Self> {
-        println!(" [AI] 正在加载模型 BAAI/bge-small-zh-v1.5 (RISC-V 兼容模式)...");
-
-        let api = Api::new()?;
-        let repo = api.model("BAAI/bge-small-zh-v1.5".to_string());
-
-        let model_path = repo.get("model.safetensors")?;
-        let tokenizer_path = repo.get("tokenizer.json")?;
-        let config_path = repo.get("config.json")?;
+        // 1. 定义模型路径查找逻辑
+        // 优先查找本地 ./model 目录，如果不存在，再尝试联网下载
+        let local_model_dir = Path::new("model");
+        
+        let (model_path, tokenizer_path, config_path) = if local_model_dir.exists() {
+            println!(" [AI] 发现本地模型目录 ./model，进入离线模式...");
+            (
+                local_model_dir.join("model.safetensors"),
+                local_model_dir.join("tokenizer.json"),
+                local_model_dir.join("config.json"),
+            )
+        } else {
+            println!(" [AI] 本地未找到模型，正在尝试从 HuggingFace 下载 BAAI/bge-small-zh-v1.5...");
+            let api = Api::new()?;
+            let repo = api.model("BAAI/bge-small-zh-v1.5".to_string());
+            (
+                repo.get("model.safetensors")?,
+                repo.get("tokenizer.json")?,
+                repo.get("config.json")?,
+            )
+        };
 
         let device = Device::Cpu;
 
+        // 2. 加载配置和分词器
         let config_content = std::fs::read_to_string(config_path)?;
         let config: Config = serde_json::from_str(&config_content)?;
         let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(anyhow::Error::msg)?;
 
+        // 3. 加载模型权重
         let vb = unsafe { 
             VarBuilder::from_mmaped_safetensors(&[model_path], candle_core::DType::F32, &device)? 
         };
         
-        // 【修改 2】使用 load() 替代 new()
+        // 4. 初始化模型
         let model = CandleBert::load(vb, &config)?;
 
         println!(" [AI] 模型加载完成！");
@@ -55,10 +70,7 @@ impl BertModel {
         let token_ids = Tensor::new(tokens.get_ids(), &self.device)?.unsqueeze(0)?;
         let token_type_ids = Tensor::new(tokens.get_type_ids(), &self.device)?.unsqueeze(0)?;
 
-        // 【修改 3】forward 增加第三个参数 None (代表没有 Attention Mask)
         let output = self.model.forward(&token_ids, &token_type_ids, None)?;
-
-        // 现在 .i() 可以用了，因为引入了 IndexOp
         let cls_embedding = output.i((0, 0))?; 
 
         let vec = cls_embedding.flatten_all()?.to_vec1()?;
