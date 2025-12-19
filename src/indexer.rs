@@ -105,7 +105,7 @@ pub fn process_and_index(file_path: &Path, index: &Index, schema: &Schema, bert:
     // 调用 extract 模块的功能
     let doc_data = extract_text(file_path)?;
 
-    // 【修改点 2】获取文件当前时间戳
+    //获取文件当前时间戳
     let file_timestamp = fs::metadata(file_path)
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::now())
@@ -138,7 +138,7 @@ pub fn process_and_index(file_path: &Path, index: &Index, schema: &Schema, bert:
         body_field => doc_data.content.as_str(),
         path_field => doc_data.path.as_str(),
         tags_field => tags_str, // <--- 存入 AI 生成的标签
-        timestamp_field => file_timestamp // 【修改点 3】写入时间戳
+        timestamp_field => file_timestamp // 写入时间戳
     ))?;
 
     index_writer.commit()?;
@@ -168,7 +168,7 @@ pub fn scan_existing_files(watch_path: &Path, index: &Index, schema: &Schema, be
                         if matches!(ext.as_str(), "txt" | "md" | "pdf") {
                              if !path.to_string_lossy().contains(".DS_Store") {
                                 
-                                // 【修改点 4】 增加判断逻辑
+                                // 增加判断逻辑
                                 if should_index_file(&path, index, schema) {
                                     // 只有需要更新时，才执行繁重的 AI 和索引任务
                                     match process_and_index(&path, index, schema, bert) {
