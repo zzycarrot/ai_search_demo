@@ -5,21 +5,26 @@ edition = "2024"
 
 [dependencies]
 # 基础工具
-anyhow = "1.0" # 错误处理神器，新手必备
-walkdir = "2.3" # 递归遍历文件夹
+anyhow = "1.0"
+walkdir = "2.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 # 文本提取 
-
-pdf-extract = "0.10" # 对应 Python 的 pdfminer
-# docx-rs = "0.4"     # 对应 Python 的 python-docx
+pdf-extract = "0.10"
 
 # 搜索与索引核心 
-
 jieba-rs = "0.8"
-tantivy = "0.25" # Rust 界最强的搜索引擎库（类似 Lucene/Elasticsearch）
-tantivy-jieba = "0.17"  # 中文分词支持
+tantivy = "0.25"
+tantivy-jieba = "0.17"
 
-# AI 模型 [cite: 7, 13]
+# AI 模型 (Candle 纯 Rust 方案)
+candle-core = "0.8.2"
+candle-nn = "0.8.2"
+candle-transformers = "0.8.2"
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 
-fastembed = "4"
+# 【关键修复】升级到 0.4 以支持 ureq feature
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+
 notify = "6.0"

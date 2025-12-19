@@ -1,43 +1,81 @@
-// src/ai.rs
-use fastembed::{TextEmbedding, InitOptions, EmbeddingModel};
 use anyhow::Result;
+// 【修改 1】引入 IndexOp trait，解决 output.i() 报错
+use candle_core::{Device, Tensor, IndexOp};
+use candle_nn::VarBuilder;
+use candle_transformers::models::bert::{BertModel as CandleBert, Config};
+use hf_hub::api::sync::Api;
 use jieba_rs::Jieba;
 use std::collections::HashSet;
+use tokenizers::Tokenizer;
 
 pub struct BertModel {
-    model: TextEmbedding,
+    model: CandleBert,
+    tokenizer: Tokenizer,
     jieba: Jieba,
+    device: Device,
 }
 
 impl BertModel {
     pub fn new() -> Result<Self> {
-        // 修复 1 & 2: 使用 new() 方法初始化，并修正模型名称
-        let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::BGESmallZHV15)
-                .with_show_download_progress(true)
-        )?;
+        println!(" [AI] 正在加载模型 BAAI/bge-small-zh-v1.5 (RISC-V 兼容模式)...");
+
+        let api = Api::new()?;
+        let repo = api.model("BAAI/bge-small-zh-v1.5".to_string());
+
+        let model_path = repo.get("model.safetensors")?;
+        let tokenizer_path = repo.get("tokenizer.json")?;
+        let config_path = repo.get("config.json")?;
+
+        let device = Device::Cpu;
+
+        let config_content = std::fs::read_to_string(config_path)?;
+        let config: Config = serde_json::from_str(&config_content)?;
+        let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(anyhow::Error::msg)?;
+
+        let vb = unsafe { 
+            VarBuilder::from_mmaped_safetensors(&[model_path], candle_core::DType::F32, &device)? 
+        };
+        
+        // 【修改 2】使用 load() 替代 new()
+        let model = CandleBert::load(vb, &config)?;
+
+        println!(" [AI] 模型加载完成！");
 
         Ok(Self {
             model,
+            tokenizer,
             jieba: Jieba::new(),
+            device,
         })
     }
+
+    fn get_embedding(&self, text: &str) -> Result<Vec<f32>> {
+        let tokens = self.tokenizer.encode(text, true).map_err(anyhow::Error::msg)?;
+        
+        let token_ids = Tensor::new(tokens.get_ids(), &self.device)?.unsqueeze(0)?;
+        let token_type_ids = Tensor::new(tokens.get_type_ids(), &self.device)?.unsqueeze(0)?;
+
+        // 【修改 3】forward 增加第三个参数 None (代表没有 Attention Mask)
+        let output = self.model.forward(&token_ids, &token_type_ids, None)?;
+
+        // 现在 .i() 可以用了，因为引入了 IndexOp
+        let cls_embedding = output.i((0, 0))?; 
+
+        let vec = cls_embedding.flatten_all()?.to_vec1()?;
+        Ok(vec)
+    }
+
     pub fn refine_query(&self, origin_query: &str) -> String {
-        // 1. 如果输入太短（比如就两个字），直接返回，不用 AI 猜
         if origin_query.chars().count() < 4 {
             return origin_query.to_string();
         }
 
-        // 2. 尝试提取 2 个核心关键词
         match self.extract_keywords(origin_query, 2) {
             Ok(keywords) => {
                 if keywords.is_empty() {
-                    // 没提取出来，降级回原文
                     origin_query.to_string()
                 } else {
                     let refined = keywords.join(" ");
-                    
-                    // 只有当关键词和原句不一样时，才提示用户
                     if refined != origin_query {
                         println!("   [AI] 意图识别: '{}' -> '{}'", origin_query, refined);
                         return refined;
@@ -59,7 +97,6 @@ impl BertModel {
             text.to_string()
         };
 
-        // 修复 3: 显式标注闭包参数类型 |w: &str|
         let words = self.jieba.cut(&truncated_text, false);
         let candidates: Vec<String> = words.into_iter()
             .map(|w: &str| w.to_string())
@@ -72,22 +109,18 @@ impl BertModel {
             return Ok(vec![]);
         }
 
-        let doc_embeddings = self.model.embed(vec![truncated_text], None)?;
-        let doc_vec = &doc_embeddings[0];
+        let doc_vec = self.get_embedding(&truncated_text)?;
 
-        let candidate_embeddings = self.model.embed(candidates.clone(), None)?;
+        let mut scored_candidates: Vec<(f32, String)> = Vec::new();
 
-        // 修复 4: 显式标注 map 参数类型
-        let mut scored_candidates: Vec<(f32, String)> = candidates.iter()
-            .zip(candidate_embeddings.iter())
-            .map(|(word, vec): (&String, &Vec<f32>)| {
-                // 调用下方的辅助函数
-                let score = cosine_similarity(doc_vec, vec);
-                (score, word.clone())
-            })
-            .collect();
+        for candidate in &candidates {
+            if let Ok(cand_vec) = self.get_embedding(candidate) {
+                let score = cosine_similarity(&doc_vec, &cand_vec);
+                scored_candidates.push((score, candidate.clone()));
+            }
+        }
 
-        scored_candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        scored_candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         let keywords = scored_candidates.into_iter()
             .take(top_k)
@@ -98,7 +131,6 @@ impl BertModel {
     }
 }
 
-// 辅助函数放在 impl 块外面
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot_product: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
