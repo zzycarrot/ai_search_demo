@@ -2,13 +2,21 @@
 use std::io::{self, Write};
 use std::path::Path;
 use anyhow::Result;
+use std::sync::Arc;
 
-// 引入你的库 (确保 Cargo.toml 中 name = "ai_search_demo")
 use ai_search_demo::indexer;
 use ai_search_demo::search;
 use ai_search_demo::config;
+use ai_search_demo::ai::BertModel;
+
 
 fn main() -> Result<()> {
+
+    println!(" [AI] 正在加载 BERT 模型 (首次运行需下载)...");
+    // 初始化 BERT，并用 Arc 包裹以便在多线程共享
+    let bert = Arc::new(BertModel::new()?); 
+    println!(" [AI] 模型加载完毕！");
+
     let watch_path = Path::new(config::WATCH_PATH);
     let storage_path = Path::new(config::STORAGE_PATH);
 
@@ -18,17 +26,17 @@ fn main() -> Result<()> {
     println!(" [后台] 正在监控: {:?}", watch_path);
     println!(" [前台] 输入关键词进行搜索 (输入 'quit' 退出)");
 
-    // 1. 调用 lib 里的 indexer 初始化索引
+   // 1. 初始化索引 (schema 里现在有 tags 字段了)
     let (index, schema) = indexer::init_persistent_index(storage_path)?;
 
-    // 2. 扫描现有文件
-    indexer::scan_existing_files(watch_path, &index, &schema)?;
+    // 2. 扫描现有文件 (传入 bert)
+    indexer::scan_existing_files(watch_path, &index, &schema, &bert)?;
 
-    // 3. 启动后台监控线程
-    // 这里的 clone 是轻量级的
+    // 3. 启动后台监控 (传入 bert)
     let index_for_watcher = index.clone();
     let schema_for_watcher = schema.clone();
-    indexer::start_watcher_thread(watch_path.to_path_buf(), index_for_watcher, schema_for_watcher);
+    let bert_for_watcher = bert.clone(); // Arc 克隆，只是引用计数+1
+    indexer::start_watcher_thread(watch_path.to_path_buf(), index_for_watcher, schema_for_watcher, bert_for_watcher);
 
     // 4. 主线程循环：处理用户输入并调用 search 模块
     loop {
