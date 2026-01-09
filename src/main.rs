@@ -6,13 +6,15 @@ use std::sync::Arc;
 
 use ai_search_demo::indexer;
 use ai_search_demo::search;
-use ai_search_demo::config;
+use ai_search_demo::config::CONFIG;
 use ai_search_demo::ai::BertModel;
 use ai_search_demo::cache::EmbeddingCache;
 use ai_search_demo::registry::FileRegistry;
 
 
 fn main() -> Result<()> {
+    // 触发配置加载 (打印配置信息)
+    let _ = &*CONFIG;
 
     println!(" [AI] 正在加载 BERT 模型 (首次运行需下载)...");
     // 初始化 BERT，并用 Arc 包裹以便在多线程共享
@@ -20,13 +22,13 @@ fn main() -> Result<()> {
     println!(" [AI] 模型加载完毕！");
 
     // 初始化 Embedding 缓存
-    let cache_path = Path::new(config::CACHE_PATH);
+    let cache_path = Path::new(&CONFIG.paths.cache_path);
     let cache = Arc::new(EmbeddingCache::new(cache_path)?);
     let (cache_count, cache_size) = cache.stats();
     println!(" [Cache] 缓存统计: {} 条记录, {} 字节", cache_count, cache_size);
 
-    let watch_path = Path::new(config::WATCH_PATH);
-    let storage_path = Path::new(config::STORAGE_PATH);
+    let watch_path = Path::new(&CONFIG.paths.watch_path);
+    let storage_path = Path::new(&CONFIG.paths.storage_path);
 
     if !watch_path.exists() { std::fs::create_dir_all(watch_path)?; }
 

@@ -149,3 +149,26 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot_product / (norm_a * norm_b) }
 }
+
+/// 关键词提取器（封装 BertModel）
+pub struct KeywordExtractor {
+    model: BertModel,
+}
+
+impl KeywordExtractor {
+    pub fn new(model_path: &Path) -> Result<Self> {
+        // TODO: 使用 model_path 参数
+        let model = BertModel::new()?;
+        Ok(Self { model })
+    }
+    
+    /// 提取关键词
+    pub fn extract(&self, text: &str) -> Result<Vec<String>> {
+        self.model.extract_keywords(text, 3)
+    }
+    
+    /// 优化查询
+    pub fn refine(&self, query: &str) -> String {
+        self.model.refine_query(query)
+    }
+}

@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::Result;
 use std::sync::Arc;
 
+use ignore::WalkBuilder;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, EventKind};
 use tantivy::schema::*;
 use tantivy::{Index, doc, IndexWriter, Term, IndexReader, ReloadPolicy};
@@ -15,6 +16,7 @@ use tantivy_jieba::JiebaTokenizer;
 
 use crate::ai::BertModel;
 use crate::cache::EmbeddingCache;
+use crate::config::CONFIG;
 use crate::extract::extract_text;
 use crate::registry::{FileRegistry, EventType};
 
@@ -258,6 +260,97 @@ pub fn scan_existing_files(
     println!(" [后台] 正在扫描现有文件...");
     let mut file_count = 0;
 
+    // 根据配置选择遍历方式
+    if CONFIG.walker.use_ripgrep_walker {
+        // 使用 ripgrep 风格遍历 (ignore crate)
+        scan_with_ripgrep_walker(watch_path, index, schema, bert, cache, registry, &mut file_count)?;
+    } else {
+        // 使用标准递归遍历
+        scan_with_std_walker(watch_path, index, schema, bert, cache, registry, &mut file_count)?;
+    }
+    
+    println!(" [后台] 初始索引完成，共处理 {} 个文件", file_count);
+    Ok(())
+}
+
+/// 使用 ripgrep 风格遍历 (基于 ignore crate)
+/// 自动尊重 .gitignore, .ignore 等忽略规则
+fn scan_with_ripgrep_walker(
+    watch_path: &Path,
+    index: &Index,
+    schema: &Schema,
+    bert: &BertModel,
+    cache: &EmbeddingCache,
+    registry: &FileRegistry,
+    file_count: &mut usize,
+) -> Result<()> {
+    let walker_config = &CONFIG.walker;
+    
+    // 构建 WalkBuilder
+    let mut builder = WalkBuilder::new(watch_path);
+    
+    // 配置遍历选项
+    builder
+        .hidden(!walker_config.skip_hidden)  // 注意: ignore crate 中 hidden(false) 表示不跳过隐藏文件
+        .git_ignore(walker_config.respect_gitignore)
+        .git_global(walker_config.respect_gitignore)
+        .git_exclude(walker_config.respect_gitignore)
+        .ignore(walker_config.respect_ignore)
+        .follow_links(walker_config.follow_symlinks);
+    
+    // 设置最大深度
+    if walker_config.max_depth > 0 {
+        builder.max_depth(Some(walker_config.max_depth));
+    }
+    
+    // 添加自定义忽略模式
+    for pattern in &walker_config.custom_ignore_patterns {
+        // 使用 overrides 添加忽略模式
+        let mut overrides = ignore::overrides::OverrideBuilder::new(watch_path);
+        overrides.add(&format!("!{}", pattern))?;
+        if let Ok(ovr) = overrides.build() {
+            builder.overrides(ovr);
+        }
+    }
+    
+    // 遍历文件
+    for result in builder.build() {
+        match result {
+            Ok(entry) => {
+                let path = entry.path();
+                
+                // 跳过目录
+                if path.is_dir() {
+                    continue;
+                }
+                
+                // 检查文件扩展名
+                if !is_supported_file(path) {
+                    continue;
+                }
+                
+                // 处理文件
+                process_file_entry(path, index, schema, bert, cache, registry, file_count);
+            }
+            Err(e) => {
+                eprintln!(" [Walker] 遍历错误: {}", e);
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// 使用标准递归遍历
+fn scan_with_std_walker(
+    watch_path: &Path,
+    index: &Index,
+    schema: &Schema,
+    bert: &BertModel,
+    cache: &EmbeddingCache,
+    registry: &FileRegistry,
+    file_count: &mut usize,
+) -> Result<()> {
     fn visit_dirs(
         dir: &Path, 
         index: &Index, 
@@ -274,42 +367,64 @@ pub fn scan_existing_files(
                 if path.is_dir() {
                     visit_dirs(&path, index, schema, file_count, bert, cache, registry)?;
                 } else if path.is_file() && is_supported_file(&path) {
-                    // 获取文件修改时间
-                    if let Some(modified_time) = get_modified_time(&path) {
-                        // 使用 registry 判断是否需要处理（原子操作）
-                        if registry.try_start_processing(&path, modified_time) {
-                            // 额外检查索引中是否已有最新版本
-                            if should_index_file(&path, index, schema) {
-                                match process_and_index(&path, index, schema, bert, cache) {
-                                    Ok(_) => *file_count += 1,
-                                    Err(e) => eprintln!("处理文件失败 {:?}: {}", path, e),
-                                }
-                            }
-                            registry.finish_processing(&path);
-                        }
-                    }
+                    process_file_entry(&path, index, schema, bert, cache, registry, file_count);
                 }
             }
         }
         Ok(())
     }
 
-    visit_dirs(watch_path, index, schema, &mut file_count, bert, cache, registry)?;
-    println!(" [后台] 初始索引完成，共处理 {} 个文件", file_count);
-    Ok(())
+    visit_dirs(watch_path, index, schema, file_count, bert, cache, registry)
+}
+
+/// 处理单个文件入口 (共用逻辑)
+fn process_file_entry(
+    path: &Path,
+    index: &Index,
+    schema: &Schema,
+    bert: &BertModel,
+    cache: &EmbeddingCache,
+    registry: &FileRegistry,
+    file_count: &mut usize,
+) {
+    let path_buf = path.to_path_buf();
+    // 获取文件修改时间
+    if let Some(modified_time) = get_modified_time(path) {
+        // 使用 registry 判断是否需要处理（原子操作）
+        if registry.try_start_processing(&path_buf, modified_time) {
+            // 额外检查索引中是否已有最新版本
+            if should_index_file(path, index, schema) {
+                match process_and_index(path, index, schema, bert, cache) {
+                    Ok(_) => *file_count += 1,
+                    Err(e) => eprintln!("处理文件失败 {:?}: {}", path, e),
+                }
+            }
+            registry.finish_processing(&path_buf);
+        }
+    }
 }
 
 /// 辅助函数：检查文件扩展名是否支持
 fn is_supported_file(path: &Path) -> bool {
+    // 过滤 .DS_Store 等系统文件
     if path.to_string_lossy().contains(".DS_Store") {
         return false;
     }
+    
     if let Some(extension) = path.extension() {
         let ext = extension.to_string_lossy().to_lowercase();
-        matches!(ext.as_str(), "txt" | "md" | "pdf")
+        // 使用配置中的支持扩展名列表
+        CONFIG.walker.supported_extensions
+            .iter()
+            .any(|supported| supported.eq_ignore_ascii_case(&ext))
     } else {
         false
     }
+}
+
+/// 辅助函数：检查文件扩展名是否支持（公开版本，供 watcher 使用）
+pub fn is_file_supported(path: &Path) -> bool {
+    is_supported_file(path)
 }
 
 /// 辅助函数：获取文件修改时间

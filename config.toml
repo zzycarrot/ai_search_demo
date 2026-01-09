@@ -1,0 +1,61 @@
+# AI 文档搜索引擎配置文件
+# AI Document Search Engine Configuration
+
+[paths]
+# 监控目录路径
+watch_path = "./docs"
+# 索引存储路径
+storage_path = "./storage"
+# Embedding 缓存路径
+cache_path = "./cache"
+# 模型目录路径
+model_path = "./model"
+
+[display]
+# 内容预览的最大字符数
+preview_max_length = 200
+# 句子搜索的起始位置
+sentence_search_start = 50
+
+[walker]
+# 是否启用 ripgrep 风格遍历
+# 启用后会自动尊重 .gitignore, .ignore 等忽略规则
+use_ripgrep_walker = true
+
+# 是否遵循 .gitignore 规则
+respect_gitignore = true
+
+# 是否遵循 .ignore 文件规则
+respect_ignore = true
+
+# 是否遵循隐藏文件规则 (以 . 开头的文件/目录)
+skip_hidden = true
+
+# 是否跟随符号链接
+follow_symlinks = false
+
+# 最大遍历深度 (0 表示无限制)
+max_depth = 0
+
+# 额外的忽略模式 (glob 格式)
+# 这些模式会被添加到默认的忽略规则中
+custom_ignore_patterns = [
+    "*.log",
+    "*.tmp",
+    "*.bak",
+    "node_modules",
+    "target",
+    "__pycache__",
+    ".git",
+]
+
+# 支持的文件扩展名
+supported_extensions = ["txt", "md", "pdf"]
+
+[ai]
+# 提取关键词数量
+keyword_count = 3
+
+[performance]
+# 索引写入器缓冲区大小 (字节)
+index_writer_memory = 50000000
