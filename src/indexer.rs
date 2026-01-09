@@ -59,56 +59,8 @@ pub fn init_persistent_index(index_path: &Path) -> Result<(Index, Schema, IndexR
     Ok((index, schema, reader))
 }
 
-// 检查文件是否需要索引
-// 返回 true 表示：数据库里没这个文件，或者文件变新了，需要重新搞
-fn should_index_file(path: &Path, index: &Index, schema: &Schema) -> bool {
-    let path_str = path.to_string_lossy();
-    let reader = match index.reader() {
-        Ok(r) => r,
-        Err(_) => return true, // 读不出索引就默认重建
-    };
-    let searcher = reader.searcher();
-    
-    let path_field = schema.get_field("path").unwrap();
-    let timestamp_field = schema.get_field("timestamp").unwrap();
-
-    // 1. 在索引里查这个路径
-    let query = Term::from_field_text(path_field, &path_str);
-    let term_query = tantivy::query::TermQuery::new(query, IndexRecordOption::Basic);
-    
-    // 找匹配的文档
-    let top_docs = match searcher.search(&term_query, &tantivy::collector::TopDocs::with_limit(1)) {
-        Ok(docs) => docs,
-        Err(_) => return true,
-    };
-
-    if top_docs.is_empty() {
-        return true; // 数据库里没这个文件 -> 必须索引
-    }
-
-    // 2. 如果找到了，读取它存的时间戳
-    let (_score, doc_address) = top_docs[0];
-    let doc: TantivyDocument = match searcher.doc(doc_address) {
-        Ok(d) => d,
-        Err(_) => return true,
-    };
-    
-    // 获取数据库里的旧时间
-    let stored_ts = doc.get_first(timestamp_field)
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-
-    // 3. 获取硬盘文件当前的时间戳
-    let current_ts = fs::metadata(path)
-        .and_then(|m| m.modified())
-        .unwrap_or(SystemTime::now())
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    // 4. 比对：如果硬盘文件时间 > 数据库存的时间，说明文件被修改过 -> 需要索引
-    current_ts > stored_ts
-}
+// 注: 已移除 should_index_file 函数，改用 cache.check_file_status() 元数据检查
+// 这样在启动时无需读取文件内容或查询索引，只需比对文件系统元数据
 
 // 从索引中删除文件
 pub fn delete_from_index(file_path: &Path, index: &Index, schema: &Schema, cache: Option<&EmbeddingCache>) -> Result<bool> {
@@ -235,14 +187,31 @@ pub fn cleanup_orphan_indexes(index: &Index, schema: &Schema, cache: &EmbeddingC
         for path_str in &orphan_paths {
             let path_term = Term::from_field_text(path_field, path_str);
             index_writer.delete_term(path_term);
-            // 同时清理缓存
+            // 同时清理 embedding 缓存和元数据缓存
             let _ = cache.remove(path_str);
+            let _ = cache.remove_file_meta(path_str);
         }
         index_writer.commit()?;
         println!("[清理] 已清理 {} 个孤儿索引", orphan_count);
     }
     
-    Ok(orphan_count)
+    // 同时清理元数据缓存中的孤儿记录（文件已删除但缓存还在）
+    let cached_paths = cache.get_all_cached_paths();
+    let mut meta_orphan_count = 0;
+    for path_str in cached_paths {
+        let path = Path::new(&path_str);
+        if !path.exists() {
+            println!("[清理] 发现孤儿元数据缓存: {}", path_str);
+            let _ = cache.remove(&path_str);
+            let _ = cache.remove_file_meta(&path_str);
+            meta_orphan_count += 1;
+        }
+    }
+    if meta_orphan_count > 0 {
+        println!("[清理] 已清理 {} 个孤儿元数据缓存", meta_orphan_count);
+    }
+    
+    Ok(orphan_count + meta_orphan_count)
 }
 
 // 扫描现有文件（使用 registry 协调）
@@ -388,16 +357,42 @@ fn process_file_entry(
     file_count: &mut usize,
 ) {
     let path_buf = path.to_path_buf();
+    let path_str = path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    
+    // 使用元数据缓存快速判断是否需要处理（不读取文件内容）
+    use crate::cache::FileStatus;
+    let status = cache.check_file_status(&path_str, path);
+    
+    match status {
+        FileStatus::Unchanged => {
+            // 文件未变化，跳过
+            return;
+        }
+        FileStatus::New => {
+            println!(" [新增] {}", path.file_name().unwrap_or_default().to_string_lossy());
+        }
+        FileStatus::Modified => {
+            println!(" [变更] {} (大小或时间变化)", path.file_name().unwrap_or_default().to_string_lossy());
+        }
+    }
+    
     // 获取文件修改时间
     if let Some(modified_time) = get_modified_time(path) {
         // 使用 registry 判断是否需要处理（原子操作）
         if registry.try_start_processing(&path_buf, modified_time) {
-            // 额外检查索引中是否已有最新版本
-            if should_index_file(path, index, schema) {
-                match process_and_index(path, index, schema, bert, cache) {
-                    Ok(_) => *file_count += 1,
-                    Err(e) => eprintln!("处理文件失败 {:?}: {}", path, e),
+            // 处理文件
+            match process_and_index(path, index, schema, bert, cache) {
+                Ok(_) => {
+                    // 索引成功后，保存元数据到缓存
+                    if let Err(e) = cache.save_file_meta(&path_str, path) {
+                        eprintln!(" [Cache] 保存元数据失败: {}", e);
+                    }
+                    *file_count += 1;
                 }
+                Err(e) => eprintln!("处理文件失败 {:?}: {}", path, e),
             }
             registry.finish_processing(&path_buf);
         }
