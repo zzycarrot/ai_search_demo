@@ -24,10 +24,16 @@ pub fn extract_text(path: &Path) -> Result<FileDoc> {
         _ => return Err(anyhow::anyhow!("跳过不支持的文件格式")),
     };
 
+    // 规范化路径：统一使用绝对路径，避免重复索引
+    let canonical_path = path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+
     Ok(FileDoc {
         title: path.file_stem().unwrap().to_string_lossy().to_string(),
         content,
-        path: path.to_string_lossy().to_string(),
+        path: canonical_path,
     })
 }
 

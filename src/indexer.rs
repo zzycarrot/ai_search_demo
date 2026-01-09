@@ -1,9 +1,8 @@
 // indexer.rs
-use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{channel, Sender, Receiver};
 use std::thread;
 use std::time::{Duration, SystemTime};
 use anyhow::Result;
@@ -11,14 +10,16 @@ use std::sync::Arc;
 
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, EventKind};
 use tantivy::schema::*;
-use tantivy::{Index, doc, IndexWriter, Term};
+use tantivy::{Index, doc, IndexWriter, Term, IndexReader, ReloadPolicy};
 use tantivy_jieba::JiebaTokenizer;
 
 use crate::ai::BertModel;
-use crate::extract::extract_text; // 使用 crate 内部引用
+use crate::cache::EmbeddingCache;
+use crate::extract::extract_text;
+use crate::registry::{FileRegistry, EventType};
 
 // 初始化持久化索引
-pub fn init_persistent_index(index_path: &Path) -> Result<(Index, Schema)> {
+pub fn init_persistent_index(index_path: &Path) -> Result<(Index, Schema, IndexReader)> {
     let mut schema_builder = Schema::builder();
 
     let text_options = TextOptions::default()
@@ -46,7 +47,14 @@ pub fn init_persistent_index(index_path: &Path) -> Result<(Index, Schema)> {
     let tokenizer = JiebaTokenizer {};
     index.tokenizers().register("jieba", tokenizer);
 
-    Ok((index, schema))
+    // 创建带自动刷新策略的 Reader
+    // OnCommitWithDelay 会在 commit 后自动刷新，延迟 500ms
+    let reader = index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::OnCommitWithDelay)
+        .try_into()?;
+
+    Ok((index, schema, reader))
 }
 
 // 检查文件是否需要索引
@@ -100,8 +108,42 @@ fn should_index_file(path: &Path, index: &Index, schema: &Schema) -> bool {
     current_ts > stored_ts
 }
 
+// 从索引中删除文件
+pub fn delete_from_index(file_path: &Path, index: &Index, schema: &Schema, cache: Option<&EmbeddingCache>) -> Result<bool> {
+    // 尝试规范化路径，如果文件已删除则使用原始路径
+    let path_str = file_path.canonicalize()
+        .unwrap_or_else(|_| file_path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    
+    let path_field = schema.get_field("path").unwrap();
+    
+    let mut index_writer: IndexWriter = index.writer(50_000_000)?;
+    
+    // 删除规范化路径
+    let path_term = Term::from_field_text(path_field, &path_str);
+    index_writer.delete_term(path_term);
+    
+    // 也尝试删除原始路径格式（兼容旧数据）
+    let original_path_str = file_path.to_string_lossy();
+    if original_path_str != path_str {
+        let original_term = Term::from_field_text(path_field, &original_path_str);
+        index_writer.delete_term(original_term);
+    }
+    
+    index_writer.commit()?;
+    
+    // 同时从缓存中删除（两种路径格式都尝试）
+    if let Some(c) = cache {
+        let _ = c.remove(&path_str);
+        let _ = c.remove(&original_path_str);
+    }
+    
+    Ok(true)
+}
+
 // 处理单个文件 (改为 pub 供 watcher 使用)
-pub fn process_and_index(file_path: &Path, index: &Index, schema: &Schema, bert: &BertModel) -> Result<()> {
+pub fn process_and_index(file_path: &Path, index: &Index, schema: &Schema, bert: &BertModel, cache: &EmbeddingCache) -> Result<()> {
     // 调用 extract 模块的功能
     let doc_data = extract_text(file_path)?;
 
@@ -113,11 +155,19 @@ pub fn process_and_index(file_path: &Path, index: &Index, schema: &Schema, bert:
         .unwrap_or_default()
         .as_secs();
 
-    // --- AI 核心步骤：生成关键词 ---
-    println!("   [AI] 正在分析文档语义...");
-    let keywords = bert.extract_keywords(&doc_data.content, 3)?; // 提取 3 个关键词
+    // --- AI 核心步骤：生成关键词 (优先使用缓存) ---
+    let keywords = if let Some(cached_keywords) = cache.get_keywords(&doc_data.path, &doc_data.content) {
+        println!("   [Cache] 命中缓存: {:?}", cached_keywords);
+        cached_keywords
+    } else {
+        println!("   [AI] 正在分析文档语义...");
+        let new_keywords = bert.extract_keywords(&doc_data.content, 3)?; // 提取 3 个关键词
+        // 存入缓存
+        let _ = cache.set_keywords(&doc_data.path, &doc_data.content, new_keywords.clone());
+        println!("   [AI] 生成标签: {:?} (已缓存)", new_keywords);
+        new_keywords
+    };
     let tags_str = keywords.join(" "); // 变成 "Rust 编程 教程" 这样的字符串存入
-    println!("   [AI] 生成标签: {:?}", keywords);
     // ---------------------------
 
     let title_field = schema.get_field("title").unwrap();
@@ -150,37 +200,92 @@ pub fn process_and_index(file_path: &Path, index: &Index, schema: &Schema, bert:
     Ok(())
 }
 
-// 扫描现有文件
-pub fn scan_existing_files(watch_path: &Path, index: &Index, schema: &Schema, bert: &BertModel) -> Result<()> {
+// 清理孤儿索引（文件已删除但索引还在）
+pub fn cleanup_orphan_indexes(index: &Index, schema: &Schema, cache: &EmbeddingCache) -> Result<usize> {
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let path_field = schema.get_field("path").unwrap();
+    
+    let mut orphan_paths: Vec<String> = Vec::new();
+    
+    // 遍历所有文档
+    for segment_reader in searcher.segment_readers() {
+        let store_reader = segment_reader.get_store_reader(1)?;
+        for doc_id in 0..segment_reader.num_docs() {
+            if let Ok(doc) = store_reader.get::<TantivyDocument>(doc_id) {
+                if let Some(path_value) = doc.get_first(path_field) {
+                    if let Some(path_str) = path_value.as_str() {
+                        let path = Path::new(path_str);
+                        if !path.exists() {
+                            println!("[清理] 发现孤儿索引: {}", path_str);
+                            orphan_paths.push(path_str.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    let orphan_count = orphan_paths.len();
+    
+    if orphan_count > 0 {
+        let mut index_writer: IndexWriter = index.writer(50_000_000)?;
+        for path_str in &orphan_paths {
+            let path_term = Term::from_field_text(path_field, path_str);
+            index_writer.delete_term(path_term);
+            // 同时清理缓存
+            let _ = cache.remove(path_str);
+        }
+        index_writer.commit()?;
+        println!("[清理] 已清理 {} 个孤儿索引", orphan_count);
+    }
+    
+    Ok(orphan_count)
+}
+
+// 扫描现有文件（使用 registry 协调）
+pub fn scan_existing_files(
+    watch_path: &Path, 
+    index: &Index, 
+    schema: &Schema, 
+    bert: &BertModel, 
+    cache: &EmbeddingCache,
+    registry: &FileRegistry,
+) -> Result<()> {
+    // 先清理孤儿索引
+    let _ = cleanup_orphan_indexes(index, schema, cache);
+    
     println!(" [后台] 正在扫描现有文件...");
     let mut file_count = 0;
 
-    fn visit_dirs(dir: &Path, index: &Index, schema: &Schema, file_count: &mut usize, bert: &BertModel) -> Result<()> {
+    fn visit_dirs(
+        dir: &Path, 
+        index: &Index, 
+        schema: &Schema, 
+        file_count: &mut usize, 
+        bert: &BertModel, 
+        cache: &EmbeddingCache,
+        registry: &FileRegistry,
+    ) -> Result<()> {
         if dir.is_dir() {
             for entry in fs::read_dir(dir)? {
                 let entry = entry?;
                 let path = entry.path();
                 if path.is_dir() {
-                    visit_dirs(&path, index, schema, file_count, bert)?;
-                } else if path.is_file() {
-                    if let Some(extension) = path.extension() {
-                        let ext = extension.to_string_lossy().to_lowercase();
-                        if matches!(ext.as_str(), "txt" | "md" | "pdf") {
-                             if !path.to_string_lossy().contains(".DS_Store") {
-                                
-                                // 增加判断逻辑
-                                if should_index_file(&path, index, schema) {
-                                    // 只有需要更新时，才执行繁重的 AI 和索引任务
-                                    match process_and_index(&path, index, schema, bert) {
-                                        Ok(_) => *file_count += 1,
-                                        Err(e) => eprintln!("处理文件失败 {:?}: {}", path, e),
-                                    }
-                                } else {
-                                    // 否则跳过
-                                    // println!(" [跳过] 文件未修改: {:?}", path.file_name().unwrap());
+                    visit_dirs(&path, index, schema, file_count, bert, cache, registry)?;
+                } else if path.is_file() && is_supported_file(&path) {
+                    // 获取文件修改时间
+                    if let Some(modified_time) = get_modified_time(&path) {
+                        // 使用 registry 判断是否需要处理（原子操作）
+                        if registry.try_start_processing(&path, modified_time) {
+                            // 额外检查索引中是否已有最新版本
+                            if should_index_file(&path, index, schema) {
+                                match process_and_index(&path, index, schema, bert, cache) {
+                                    Ok(_) => *file_count += 1,
+                                    Err(e) => eprintln!("处理文件失败 {:?}: {}", path, e),
                                 }
-                                
-                             }
+                            }
+                            registry.finish_processing(&path);
                         }
                     }
                 }
@@ -189,61 +294,171 @@ pub fn scan_existing_files(watch_path: &Path, index: &Index, schema: &Schema, be
         Ok(())
     }
 
-    visit_dirs(watch_path, index, schema, &mut file_count, bert)?;
+    visit_dirs(watch_path, index, schema, &mut file_count, bert, cache, registry)?;
     println!(" [后台] 初始索引完成，共处理 {} 个文件", file_count);
     Ok(())
 }
 
-// 启动监控线程
-pub fn start_watcher_thread(watch_path: PathBuf, index: Index, schema: Schema, bert: Arc<BertModel>) {
+/// 辅助函数：检查文件扩展名是否支持
+fn is_supported_file(path: &Path) -> bool {
+    if path.to_string_lossy().contains(".DS_Store") {
+        return false;
+    }
+    if let Some(extension) = path.extension() {
+        let ext = extension.to_string_lossy().to_lowercase();
+        matches!(ext.as_str(), "txt" | "md" | "pdf")
+    } else {
+        false
+    }
+}
+
+/// 辅助函数：获取文件修改时间
+fn get_modified_time(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
+}
+
+/// 处理单个文件事件（统一入口）
+fn handle_file_event(
+    path: &Path,
+    index: &Index,
+    schema: &Schema,
+    bert: &BertModel,
+    cache: &EmbeddingCache,
+    registry: &FileRegistry,
+) -> Result<bool> {
+    // 检查文件是否存在
+    if !path.exists() {
+        // 文件已删除
+        delete_from_index(path, index, schema, Some(cache))?;
+        registry.mark_deleted(&path.to_path_buf());
+        println!("\n[删除] 已从索引移除: {:?}", path.file_name().unwrap_or_default());
+        print!("> ");
+        let _ = io::stdout().flush();
+        return Ok(true);
+    }
+
+    // 获取文件修改时间
+    let modified_time = match get_modified_time(path) {
+        Some(t) => t,
+        None => return Ok(false),
+    };
+
+    // 尝试获取处理权（原子操作）
+    if !registry.try_start_processing(&path.to_path_buf(), modified_time) {
+        // 已被处理或正在处理中
+        return Ok(false);
+    }
+
+    // 等待文件写入完成
+    thread::sleep(Duration::from_millis(200));
+
+    // 执行索引
+    let result = process_and_index(path, index, schema, bert, cache);
+
+    // 完成处理
+    registry.finish_processing(&path.to_path_buf());
+
+    result.map(|_| true)
+}
+
+/// 启动监控线程（先于扫描启动）
+/// 返回一个信号发送器，用于通知扫描完成
+pub fn start_watcher_thread(
+    watch_path: PathBuf, 
+    index: Index, 
+    schema: Schema, 
+    bert: Arc<BertModel>, 
+    cache: Arc<EmbeddingCache>,
+    registry: FileRegistry,
+) -> Sender<()> {
+    let (scan_complete_tx, scan_complete_rx): (Sender<()>, Receiver<()>) = channel();
+    
     thread::spawn(move || {
         let (tx, rx) = channel();
-        let mut watcher = RecommendedWatcher::new(tx, Config::default()).unwrap();
-        // 使用文件修改时间而不是处理时间戳来判断文件是否真的变化了
-        let mut file_mod_times: HashMap<PathBuf, std::time::SystemTime> = HashMap::new();
+        let mut watcher = match RecommendedWatcher::new(tx, Config::default()) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("监控启动失败: {:?}", e);
+                return;
+            }
+        };
 
         if let Err(e) = watcher.watch(&watch_path, RecursiveMode::Recursive) {
             eprintln!("监控启动失败: {:?}", e);
             return;
         }
 
+        println!(" [监控] 文件监控已启动");
+
+        // 等待扫描完成信号
+        let _ = scan_complete_rx.recv();
+        println!(" [监控] 扫描完成，开始处理实时事件");
+
+        // 处理扫描期间收集的待处理事件
+        let pending_events = registry.complete_scan();
+        for event in pending_events {
+            if is_supported_file(&event.path) {
+                match event.event_type {
+                    EventType::Create | EventType::Modify => {
+                        let _ = handle_file_event(&event.path, &index, &schema, &bert, &cache, &registry);
+                    }
+                    EventType::Delete => {
+                        let _ = delete_from_index(&event.path, &index, &schema, Some(&cache));
+                        registry.mark_deleted(&event.path);
+                    }
+                }
+            }
+        }
+
+        // 处理后续实时事件
         for res in rx {
             match res {
                 Ok(event) => {
-                    match event.kind {
-                        EventKind::Create(_) | EventKind::Modify(_) => {
-                            for path in event.paths {
-                                if path.is_file() && !path.to_string_lossy().contains(".DS_Store") {
-                                    // 检查文件扩展名
-                                    if let Some(extension) = path.extension() {
-                                        let ext = extension.to_string_lossy().to_lowercase();
-                                        if matches!(ext.as_str(), "txt" | "md" | "pdf") {
-                                            // 检查文件修改时间是否真的发生了变化
-                                            if let Ok(metadata) = fs::metadata(&path) {
-                                                if let Ok(modified) = metadata.modified() {
-                                                    let should_process = match file_mod_times.get(&path) {
-                                                        Some(&last_mod) => modified != last_mod,
-                                                        None => true, // 新文件
-                                                    };
+                    // 只处理有意义的事件
+                    let event_type = match event.kind {
+                        EventKind::Create(_) => Some(EventType::Create),
+                        EventKind::Modify(notify::event::ModifyKind::Data(_)) => Some(EventType::Modify),
+                        EventKind::Remove(_) => Some(EventType::Delete),
+                        _ => None,
+                    };
 
-                                                    if should_process {
-                                                        file_mod_times.insert(path.clone(), modified);
-                                                        // 等待文件写入完成
-                                                        thread::sleep(Duration::from_millis(500));
-                                                        let _ = process_and_index(&path, &index, &schema, &bert);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                    let event_type = match event_type {
+                        Some(t) => t,
+                        None => continue,
+                    };
+
+                    for path in event.paths {
+                        if !is_supported_file(&path) {
+                            continue;
+                        }
+
+                        match event_type {
+                            EventType::Create | EventType::Modify => {
+                                // 检查文件是否存在（macOS 可能把删除误报为 Modify）
+                                if !path.exists() {
+                                    let _ = delete_from_index(&path, &index, &schema, Some(&cache));
+                                    registry.mark_deleted(&path);
+                                    println!("\n[删除] 已从索引移除: {:?}", path.file_name().unwrap_or_default());
+                                    print!("> ");
+                                    let _ = io::stdout().flush();
+                                } else {
+                                    let _ = handle_file_event(&path, &index, &schema, &bert, &cache, &registry);
                                 }
                             }
-                        },
-                        _ => {},
+                            EventType::Delete => {
+                                let _ = delete_from_index(&path, &index, &schema, Some(&cache));
+                                registry.mark_deleted(&path);
+                                println!("\n[删除] 已从索引移除: {:?}", path.file_name().unwrap_or_default());
+                                print!("> ");
+                                let _ = io::stdout().flush();
+                            }
+                        }
                     }
-                },
+                }
                 Err(e) => eprintln!("Watch error: {:?}", e),
             }
         }
     });
+
+    scan_complete_tx
 }

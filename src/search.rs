@@ -1,13 +1,12 @@
 // search.rs
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::{Index, TantivyDocument};
+use tantivy::{Index, IndexReader, TantivyDocument};
 use tantivy::schema::*;
 use anyhow::Result;
 
 // 这个函数现在只负责搜索，不负责建索引
-pub fn search_index(index: &Index, query_str: &str) -> Result<()> {
-    let reader = index.reader()?;
+pub fn search_index(reader: &IndexReader, index: &Index, query_str: &str) -> Result<()> {
     let searcher = reader.searcher();
     
     // 获取 Schema 用于字段解析

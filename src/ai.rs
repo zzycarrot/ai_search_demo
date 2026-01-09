@@ -5,7 +5,7 @@ use candle_transformers::models::bert::{BertModel as CandleBert, Config};
 use hf_hub::api::sync::Api;
 use jieba_rs::Jieba;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokenizers::Tokenizer;
 
 pub struct BertModel {
